@@ -1,4 +1,286 @@
-  $("#loanForm").addEventListener("submit", async event => {
+ /* Real Alpha Shylock Loan — Supabase integration */
+"use strict";
+
+(() => {
+  const $ = (selector) => document.querySelector(selector);
+  const cfg = window.SUPABASE_CONFIG || {};
+  const fmt = (n) => "KSh " + Number(n).toLocaleString("en-KE");
+  const supabaseReady = Boolean(window.supabase && cfg.url && cfg.publishableKey);
+  const client = supabaseReady
+    ? window.supabase.createClient(cfg.url, cfg.publishableKey)
+    : null;
+
+  const show = (node, message, kind = "ok") => {
+    if (!node) return;
+    node.textContent = message;
+    node.className = "msg show " + kind;
+  };
+
+  const clear = (node) => {
+    if (!node) return;
+    node.textContent = "";
+    node.className = "msg";
+  };
+
+  const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, ch => ({
+    "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
+  })[ch]);
+
+  if (!supabaseReady) {
+    show($("#authMsg"), "Supabase configuration could not be loaded. Check supabase-config.js.", "err");
+    return;
+  }
+
+  $("#year").textContent = new Date().getFullYear();
+
+  $("#portalBtn").addEventListener("click", () =>
+    $("#portal").scrollIntoView({behavior:"smooth"})
+  );
+
+  const amountSlider = $("#amt");
+  const amountOutput = $("#amtOut");
+
+  amountSlider.addEventListener("input", () =>
+    amountOutput.textContent = fmt(amountSlider.value)
+  );
+
+  $("#useAmt").addEventListener("click", () =>
+    $("#loanAmount").value = amountSlider.value
+  );
+
+  document.querySelectorAll("[data-type]").forEach(link => {
+    link.addEventListener("click", () =>
+      $("#loanType").value = link.dataset.type
+    );
+  });
+
+  const marital = $("#maritalStatus");
+  const spouse = $("#spouseName");
+
+  const syncSpouse = () => {
+    const married = marital.value === "Married";
+    spouse.disabled = !married;
+    spouse.required = married;
+    if (!married) spouse.value = "";
+  };
+
+  marital.addEventListener("change", syncSpouse);
+  syncSpouse();
+
+  const phoneOk = value => /^(?:\+254|0)[17]\d{8}$/.test(value.trim());
+
+  const imageError = input => {
+    const file = input.files?.[0];
+    const label = input.labels?.[0]?.textContent.replace(/\*/g, "").trim() || "file";
+
+    if (!file) return "Please select " + label + ".";
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type))
+      return label + " must be JPG, PNG or WebP.";
+    if (file.size > 5 * 1024 * 1024)
+      return label + " must be 5 MB or smaller.";
+
+    return "";
+  };
+
+  let currentUser = null;
+  let isStaff = false;
+
+  const authMessage = $("#authMsg");
+  const authForm = $("#authForm");
+  let authMode = "login";
+
+  document.querySelectorAll("[data-tab]").forEach(tab => {
+    tab.addEventListener("click", () => {
+      authMode = tab.dataset.tab;
+      const registering = authMode === "register";
+
+      document.querySelectorAll("[data-tab]").forEach(item => {
+        item.classList.toggle("on", item === tab);
+        item.setAttribute("aria-selected", String(item === tab));
+      });
+
+      $("#nameWrap").classList.toggle("hidden", !registering);
+      $("#authName").required = registering;
+      $("#confirmWrap").classList.toggle("hidden", !registering);
+      $("#confirmPassword").required = registering;
+      $("#authBtn").textContent = registering ? "Create account" : "Login";
+      $("#authPassword").autocomplete = registering ? "new-password" : "current-password";
+
+      clear(authMessage);
+    });
+  });
+
+  authForm.addEventListener("submit", async event => {
+    event.preventDefault();
+    clear(authMessage);
+
+    if (!authForm.reportValidity()) return;
+
+    const email = $("#authEmail").value.trim().toLowerCase();
+    const password = $("#authPassword").value;
+
+    try {
+      if (authMode === "register") {
+        if (password !== $("#confirmPassword").value) {
+          return show(authMessage, "The passwords do not match.", "err");
+        }
+
+        const fullName = $("#authName").value.trim();
+
+        const { data, error } = await client.auth.signUp({
+          email,
+          password,
+          options: { data: { full_name: fullName } }
+        });
+
+        if (error) throw error;
+
+        if (data.session) {
+          show(authMessage, "Account created and signed in successfully.", "ok");
+        } else {
+          show(authMessage, "Account created. Check your email for the confirmation link, then sign in.", "ok");
+        }
+
+        authForm.reset();
+        document.querySelector('[data-tab="login"]').click();
+
+      } else {
+        const { error } = await client.auth.signInWithPassword({
+          email,
+          password
+        });
+
+        if (error) throw error;
+
+        authForm.reset();
+        show(authMessage, "You are signed in.", "ok");
+      }
+
+    } catch (error) {
+      show(authMessage, error.message || "Authentication failed.", "err");
+    }
+  });
+
+  async function refreshSession() {
+    const { data, error } = await client.auth.getSession();
+
+    if (error) console.error(error);
+
+    currentUser = data.session?.user || null;
+    isStaff = false;
+
+    if (currentUser) {
+      const { data: roleRows, error: roleError } = await client
+        .from("user_roles")
+        .select("role")
+        .eq("user_id", currentUser.id);
+
+      if (!roleError) {
+        isStaff = (roleRows || []).some(row =>
+          ["admin", "staff"].includes(row.role)
+        );
+      }
+    }
+
+    renderAccountState();
+  }
+
+  function renderAccountState() {
+    const message = $("#authMsg");
+
+    if (!currentUser) {
+      $("#staffPanel").classList.add("hidden");
+      $("#authBtn").disabled = false;
+      $("#authBtn").type = "submit";
+      $("#authBtn").onclick = null;
+      $("#authBtn").textContent = authMode === "register" ? "Create account" : "Login";
+      return;
+    }
+
+    const name = currentUser.user_metadata?.full_name || currentUser.email;
+
+    show(message, "Signed in as " + name + ". You can now submit an application.", "ok");
+
+    $("#authBtn").textContent = "Sign out";
+    $("#authBtn").type = "button";
+
+    $("#authBtn").onclick = async () => {
+      const { error } = await client.auth.signOut();
+
+      if (error) {
+        show(message, error.message, "err");
+      } else {
+        currentUser = null;
+        isStaff = false;
+        $("#authBtn").type = "submit";
+        $("#authBtn").onclick = null;
+        $("#authBtn").textContent = authMode === "register" ? "Create account" : "Login";
+        $("#staffPanel").classList.add("hidden");
+        show(message, "You have signed out.", "ok");
+      }
+    };
+
+    if (isStaff) {
+      $("#staffPanel").classList.remove("hidden");
+      loadStaffApplications();
+    } else {
+      $("#staffPanel").classList.add("hidden");
+    }
+
+    loadMyApplications();
+  }
+
+  async function loadMyApplications() {
+    if (!currentUser) return;
+
+    const { data, error } = await client
+      .from("loan_applications")
+      .select("reference,loan_type,loan_amount,status,created_at")
+      .eq("applicant_id", currentUser.id)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.warn("Could not load application history:", error.message);
+      return;
+    }
+
+    const existing = $("#myApplications");
+    if (existing) existing.remove();
+
+    const list = document.createElement("div");
+    list.id = "myApplications";
+    list.className = "note";
+    list.innerHTML = "<strong>Your applications</strong>";
+
+    if (!data.length) {
+      list.insertAdjacentHTML("beforeend", "<p>You have not submitted an application yet.</p>");
+    } else {
+      const ul = document.createElement("ul");
+
+      data.forEach(app => {
+        const li = document.createElement("li");
+        li.textContent = `${app.reference} · ${app.loan_type} · ${fmt(app.loan_amount)} · ${app.status}`;
+        ul.appendChild(li);
+      });
+
+      list.appendChild(ul);
+    }
+
+    $("#authForm").after(list);
+  }
+
+  async function uploadPrivateDocument(file, path) {
+    const { error } = await client.storage
+      .from("loan-documents")
+      .upload(path, file, {
+        upsert: false,
+        contentType: file.type,
+        cacheControl: "3600"
+      });
+
+    if (error) throw error;
+    return path;
+  } $("#loanForm").addEventListener("submit", async event => {
     event.preventDefault();
 
     const form = event.currentTarget;
