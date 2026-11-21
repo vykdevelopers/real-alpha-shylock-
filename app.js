@@ -1,10 +1,11 @@
- /* Real Alpha Shylock Loan — Supabase integration */
+/* Real Alpha Shylock Loan — Supabase integration (with customer dashboard) */
 "use strict";
 
 (() => {
   const $ = (selector) => document.querySelector(selector);
   const cfg = window.SUPABASE_CONFIG || {};
   const fmt = (n) => "KSh " + Number(n).toLocaleString("en-KE");
+  const fmtDate = (d) => new Date(d).toLocaleDateString("en-KE", { day: "numeric", month: "short", year: "numeric" });
   const supabaseReady = Boolean(window.supabase && cfg.url && cfg.publishableKey);
   const client = supabaseReady
     ? window.supabase.createClient(cfg.url, cfg.publishableKey)
@@ -26,15 +27,27 @@
     "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
   })[ch]);
 
+  const el = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+
   if (!supabaseReady) {
     show($("#authMsg"), "Supabase configuration could not be loaded. Check supabase-config.js.", "err");
     return;
   }
 
+  let currentUser = null;
+  let isStaff = false;
+  let justLoggedIn = false;
+  let wasLoggedIn = false;
+
   $("#year").textContent = new Date().getFullYear();
 
   $("#portalBtn").addEventListener("click", () =>
-    $("#portal").scrollIntoView({behavior:"smooth"})
+    $(currentUser ? "#dashboard" : "#portal").scrollIntoView({behavior:"smooth"})
   );
 
   const amountSlider = $("#amt");
@@ -81,9 +94,6 @@
 
     return "";
   };
-
-  let currentUser = null;
-  let isStaff = false;
 
   const authMessage = $("#authMsg");
   const authForm = $("#authForm");
@@ -136,6 +146,7 @@
         if (error) throw error;
 
         if (data.session) {
+          justLoggedIn = true;
           show(authMessage, "Account created and signed in successfully.", "ok");
         } else {
           show(authMessage, "Account created. Check your email for the confirmation link, then sign in.", "ok");
@@ -145,12 +156,13 @@
         document.querySelector('[data-tab="login"]').click();
 
       } else {
+        justLoggedIn = true;
         const { error } = await client.auth.signInWithPassword({
           email,
           password
         });
 
-        if (error) throw error;
+        if (error) { justLoggedIn = false; throw error; }
 
         authForm.reset();
         show(authMessage, "You are signed in.", "ok");
@@ -159,6 +171,12 @@
     } catch (error) {
       show(authMessage, error.message || "Authentication failed.", "err");
     }
+  });
+
+  $("#logoutBtn").addEventListener("click", async () => {
+    const { error } = await client.auth.signOut();
+    if (error) console.error(error);
+    else $("#home").scrollIntoView({behavior:"smooth"});
   });
 
   async function refreshSession() {
@@ -186,39 +204,32 @@
   }
 
   function renderAccountState() {
-    const message = $("#authMsg");
+    const portal = $("#portal");
+    const dashboard = $("#dashboard");
 
     if (!currentUser) {
+      portal.classList.remove("hidden");
+      dashboard.classList.add("hidden");
       $("#staffPanel").classList.add("hidden");
+      $("#portalBtn").textContent = "Portal";
       $("#authBtn").disabled = false;
-      $("#authBtn").type = "submit";
-      $("#authBtn").onclick = null;
       $("#authBtn").textContent = authMode === "register" ? "Create account" : "Login";
+      if (wasLoggedIn) show(authMessage, "You have signed out.", "ok");
+      wasLoggedIn = false;
       return;
     }
 
+    wasLoggedIn = true;
     const name = currentUser.user_metadata?.full_name || currentUser.email;
 
-    show(message, "Signed in as " + name + ". You can now submit an application.", "ok");
+    portal.classList.add("hidden");
+    dashboard.classList.remove("hidden");
+    $("#portalBtn").textContent = "Dashboard";
+    $("#dashHello").textContent = "Welcome back, " + String(name).split(" ")[0];
+    $("#dashEmail").textContent = currentUser.email;
 
-    $("#authBtn").textContent = "Sign out";
-    $("#authBtn").type = "button";
-
-    $("#authBtn").onclick = async () => {
-      const { error } = await client.auth.signOut();
-
-      if (error) {
-        show(message, error.message, "err");
-      } else {
-        currentUser = null;
-        isStaff = false;
-        $("#authBtn").type = "submit";
-        $("#authBtn").onclick = null;
-        $("#authBtn").textContent = authMode === "register" ? "Create account" : "Login";
-        $("#staffPanel").classList.add("hidden");
-        show(message, "You have signed out.", "ok");
-      }
-    };
+    if (!$("#fullName").value.trim()) $("#fullName").value = currentUser.user_metadata?.full_name || "";
+    if (!$("#email").value.trim()) $("#email").value = currentUser.email;
 
     if (isStaff) {
       $("#staffPanel").classList.remove("hidden");
@@ -228,45 +239,83 @@
     }
 
     loadMyApplications();
+
+    if (justLoggedIn) {
+      justLoggedIn = false;
+      dashboard.scrollIntoView({behavior:"smooth"});
+    }
+  }
+
+  const STEP = { "Pending": 0, "Under Review": 1, "Approved": 2, "Rejected": 2 };
+
+  function buildTracker(status) {
+    const at = STEP[status] ?? 0;
+    const rejected = status === "Rejected";
+    const labels = ["Submitted", "Under review", (status === "Approved" || rejected) ? status : "Decision"];
+    const ol = el("ol", "track");
+
+    labels.forEach((label, i) => {
+      let cls = i < at ? "done" : "";
+      if (i === at) cls = rejected ? "bad" : status === "Approved" ? "done" : "now";
+      ol.appendChild(el("li", cls, label));
+    });
+
+    return ol;
   }
 
   async function loadMyApplications() {
     if (!currentUser) return;
 
+    const list = $("#dashList");
+    const stats = $("#dashStats");
+
     const { data, error } = await client
       .from("loan_applications")
-      .select("reference,loan_type,loan_amount,status,created_at")
+      .select("reference,loan_type,loan_amount,status,created_at,updated_at")
       .eq("applicant_id", currentUser.id)
       .order("created_at", { ascending: false });
 
     if (error) {
       console.warn("Could not load application history:", error.message);
+      list.textContent = "Could not load your applications. Please refresh the page.";
       return;
     }
 
-    const existing = $("#myApplications");
-    if (existing) existing.remove();
-
-    const list = document.createElement("div");
-    list.id = "myApplications";
-    list.className = "note";
-    list.innerHTML = "<strong>Your applications</strong>";
+    const count = (fn) => data.filter(fn).length;
+    stats.replaceChildren(...[
+      ["Applications", data.length],
+      ["In progress", count(a => a.status === "Pending" || a.status === "Under Review")],
+      ["Approved", count(a => a.status === "Approved")]
+    ].map(([label, value]) => {
+      const box = el("div", "stat");
+      box.append(el("b", "", String(value)), el("span", "", label));
+      return box;
+    }));
 
     if (!data.length) {
-      list.insertAdjacentHTML("beforeend", "<p>You have not submitted an application yet.</p>");
-    } else {
-      const ul = document.createElement("ul");
-
-      data.forEach(app => {
-        const li = document.createElement("li");
-        li.textContent = `${app.reference} · ${app.loan_type} · ${fmt(app.loan_amount)} · ${app.status}`;
-        ul.appendChild(li);
-      });
-
-      list.appendChild(ul);
+      list.replaceChildren(el("p", "empty", "You have not applied yet. Your applications and their progress will appear here."));
+      return;
     }
 
-    $("#authForm").after(list);
+    list.replaceChildren(...data.map(app => {
+      const card = el("article", "app");
+
+      const head = el("div", "app-head");
+      const left = el("div");
+      left.append(
+        el("h4", "", app.loan_type),
+        el("small", "", `Ref ${app.reference} · Applied ${fmtDate(app.created_at)}`)
+      );
+      const right = el("div", "app-amt");
+      right.append(
+        el("b", "", fmt(app.loan_amount)),
+        el("span", "badge s-" + app.status.replace(/\s/g, "").toLowerCase(), app.status)
+      );
+      head.append(left, right);
+
+      card.append(head, buildTracker(app.status), el("small", "upd", "Last updated " + fmtDate(app.updated_at)));
+      return card;
+    }));
   }
 
   async function uploadPrivateDocument(file, path) {
@@ -280,7 +329,9 @@
 
     if (error) throw error;
     return path;
-  } $("#loanForm").addEventListener("submit", async event => {
+  }
+
+  $("#loanForm").addEventListener("submit", async event => {
     event.preventDefault();
 
     const form = event.currentTarget;
@@ -384,11 +435,12 @@
 
       if (error) throw error;
 
-      show(message, `Application ${reference} was submitted successfully. Sign in later to track its status.`, "ok");
+      show(message, `Application ${reference} was submitted successfully. Track its status in your dashboard.`, "ok");
 
       form.reset();
       syncSpouse();
       await loadMyApplications();
+      $("#dashboard").scrollIntoView({behavior:"smooth"});
 
     } catch (error) {
       console.error(error);
